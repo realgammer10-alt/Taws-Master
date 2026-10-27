@@ -1,0 +1,34 @@
+{
+  "resources": {
+    "cloudtrail-trails": {
+      "display_name": "CloudTrail Trails",
+      "service": "cloudtrail",
+      "sdk_method": "describe_trails",
+      "sdk_method_params": {},
+      "response_path": "trails",
+      "id_field": "TrailARN",
+      "name_field": "Name",
+      "is_global": false,
+      "columns": [
+        { "header": "TRAIL NAME", "json_path": "Name", "width": 30 },
+        { "header": "S3 BUCKET", "json_path": "S3BucketName", "width": 35 },
+        { "header": "MULTI-REGION", "json_path": "IsMultiRegionTrail", "width": 15 },
+        { "header": "LOG VALIDATION", "json_path": "LogFileValidationEnabled", "width": 15 }
+      ],
+      "sub_resources": [],
+      "actions": [],
+      "api_config": {
+        "protocol": "json",
+        "action": "DescribeTrails",
+        "response_root": "/trailList"
+      },
+      "field_mappings": {
+        "Name": { "source": "/Name", "default": "-" },
+        "TrailARN": { "source": "/TrailARN", "default": "-" },
+        "S3BucketName": { "source": "/S3BucketName", "default": "-" },
+        "IsMultiRegionTrail": { "source": "/IsMultiRegionTrail", "transform": "bool_to_yes_no" },
+        "LogFileValidationEnabled": { "source": "/LogFileValidationEnabled", "transform": "bool_to_yes_no" }
+      }
+    }
+  }
+}

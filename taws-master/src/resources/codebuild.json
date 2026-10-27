@@ -1,0 +1,31 @@
+{
+  "resources": {
+    "codebuild-projects": {
+      "display_name": "CodeBuild Projects",
+      "service": "codebuild",
+      "sdk_method": "list_projects",
+      "sdk_method_params": {},
+      "response_path": "projects",
+      "id_field": "name",
+      "name_field": "name",
+      "is_global": false,
+      "columns": [
+        { "header": "PROJECT NAME", "json_path": "name", "width": 50 }
+      ],
+      "sub_resources": [],
+      "actions": [],
+      "api_config": {
+        "protocol": "json",
+        "action": "ListProjects",
+        "response_root": "/projects",
+        "pagination": {
+          "input_token": "nextToken",
+          "output_token": "/nextToken"
+        }
+      },
+      "field_mappings": {
+        "name": { "source": "", "default": "-" }
+      }
+    }
+  }
+}

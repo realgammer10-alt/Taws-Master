@@ -1,0 +1,2130 @@
+use crate::aws;
+use crate::aws::client::AwsClients;
+use crate::config::Config;
+use crate::resource::{
+    extract_json_value, fetch_resources_paginated, get_all_resource_keys, get_resource,
+    ResourceDef, ResourceFilter,
+};
+use anyhow::Result;
+use crossterm::event::KeyCode;
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use serde_json::Value;
+
+pub const AUTO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Normal,       // Viewing list
+    Command,      // : command input
+    Help,         // ? help popup
+    Confirm,      // Confirmation dialog
+    Warning,      // Warning/info dialog (OK only)
+    Profiles,     // Profile selection
+    Regions,      // Region selection
+    Describe,     // Viewing JSON details of selected item
+    SsoLogin,     // SSO login dialog (IAM Identity Center)
+    ConsoleLogin, // Console login dialog (aws login)
+    LogTail,      // Tailing CloudWatch logs
+}
+
+/// Pending action that requires confirmation
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    /// Service name (e.g., "ec2")
+    pub service: String,
+    /// SDK method to call (e.g., "terminate_instance")  
+    pub sdk_method: String,
+    /// Resource ID to act on
+    pub resource_id: String,
+    /// Display message for confirmation dialog
+    pub message: String,
+    /// If true, default selection is No (kept for potential future use)
+    #[allow(dead_code)]
+    pub default_no: bool,
+    /// If true, show as destructive (red)
+    pub destructive: bool,
+    /// Currently selected option (true = Yes, false = No)
+    pub selected_yes: bool,
+}
+
+/// Parent context for hierarchical navigation
+#[derive(Debug, Clone)]
+pub struct ParentContext {
+    /// Parent resource key (e.g., "vpc")
+    pub resource_key: String,
+    /// Parent item (the selected VPC, etc.)
+    pub item: Value,
+    /// Display name for breadcrumb
+    pub display_name: String,
+    /// Saved selection index to restore when navigating back
+    pub saved_selected: usize,
+}
+
+/// AWS API Filters for server-side filtering
+/// Supports key=value pairs like: architecture=arm64, owner=amazon, tag:Environment=prod
+#[derive(Debug, Clone, Default)]
+pub struct AwsFilters {
+    /// List of filter key-value pairs
+    pub filters: Vec<(String, String)>,
+}
+
+impl AwsFilters {
+    /// Parse filters from text (format: "Filters: key=value, key2=value2")
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if !text.to_lowercase().starts_with("filters:") {
+            return None;
+        }
+
+        let filters_part = text[8..].trim(); // Skip "Filters:"
+        if filters_part.is_empty() {
+            return None;
+        }
+
+        let mut filters = Vec::new();
+        for part in filters_part.split(',') {
+            let part = part.trim();
+            if let Some(eq_pos) = part.find('=') {
+                let key = part[..eq_pos].trim().to_string();
+                let value = part[eq_pos + 1..].trim().to_string();
+                if !key.is_empty() && !value.is_empty() {
+                    filters.push((key, value));
+                }
+            }
+        }
+
+        if filters.is_empty() {
+            None
+        } else {
+            Some(AwsFilters { filters })
+        }
+    }
+
+    /// Display string for the filters
+    pub fn display(&self) -> String {
+        let pairs: Vec<String> = self
+            .filters
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        format!("Filters: {}", pairs.join(", "))
+    }
+}
+
+pub struct App {
+    // AWS Clients
+    pub clients: AwsClients,
+
+    // Current resource being viewed
+    pub current_resource_key: String,
+
+    // Dynamic data storage (JSON)
+    pub items: Vec<Value>,
+    pub filtered_items: Vec<Value>,
+
+    // Navigation state
+    pub selected: usize,
+    pub mode: Mode,
+    pub filter_text: String,
+    pub filter_active: bool,
+
+    // AWS API filters state (unified filter system)
+    pub aws_filters: Option<AwsFilters>,
+    pub filters_autocomplete_shown: bool,
+
+    // Hierarchical navigation
+    pub parent_context: Option<ParentContext>,
+    pub navigation_stack: Vec<ParentContext>,
+
+    // Command input
+    pub command_text: String,
+    pub command_suggestions: Vec<String>,
+    pub command_suggestion_selected: usize,
+    pub command_preview: Option<String>, // Ghost text for hovered suggestion
+
+    // Profile/Region
+    pub profile: String,
+    pub region: String,
+    pub available_profiles: Vec<String>,
+    pub available_regions: Vec<String>,
+    pub profiles_selected: usize,
+    pub regions_selected: usize,
+
+    // Confirmation
+    pub pending_action: Option<PendingAction>,
+
+    // UI state
+    pub loading: bool,
+    pub error_message: Option<String>,
+    pub status_message: Option<String>, // Transient success/info message (not an error)
+    pub describe_scroll: usize,
+    pub describe_data: Option<Value>, // Full resource details from describe API
+    pub last_action_display_name: Option<String>,
+
+    // Describe search state
+    pub describe_search_text: String,
+    pub describe_search_active: bool,
+    pub describe_match_lines: Vec<usize>, // Line numbers containing matches
+    pub describe_current_match: usize,    // Index into match_lines
+
+    // Auto-refresh
+    pub auto_refresh_enabled: bool,
+    pub last_refresh: std::time::Instant,
+    pub api_health_check: Option<ApiHealthCheck>,
+
+    // Persistent configuration
+    pub config: Config,
+
+    // Key press tracking for sequences (e.g., 'gg')
+    pub last_key_press: Option<(KeyCode, std::time::Instant)>,
+
+    // Read-only mode (blocks all write operations)
+    pub readonly: bool,
+
+    // Warning message for modal dialog
+    pub warning_message: Option<String>,
+
+    // Custom endpoint URL (for LocalStack, etc.)
+    pub endpoint_url: Option<String>,
+
+    // SSO login state (IAM Identity Center)
+    pub sso_state: Option<SsoLoginState>,
+
+    // Console login state (aws login)
+    pub console_login_state: Option<ConsoleLoginState>,
+
+    // Console login child process (not in ConsoleLoginState because Child is not Clone)
+    pub console_login_child: Option<std::process::Child>,
+
+    // Console login URL receiver (for capturing URL from subprocess stderr)
+    pub console_login_rx: Option<std::sync::mpsc::Receiver<crate::aws::console_login::LoginInfo>>,
+
+    // Pagination state
+    pub pagination: PaginationState,
+
+    // Log tail state
+    pub log_tail_state: Option<LogTailState>,
+
+    // SSM connect request (instance_id, region, profile)
+    pub ssm_connect_request: Option<SsmConnectRequest>,
+
+    // Fuzzy matcher for filtering (reused to avoid repeated allocations)
+    pub fuzzy_matcher: SkimMatcherV2,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiHealthCheck {
+    pub service: String,
+    pub healthy: bool,
+    pub latency: std::time::Duration,
+    pub checked_at: std::time::Instant,
+}
+
+impl ApiHealthCheck {
+    fn from_request(service: String, healthy: bool, latency: std::time::Duration) -> Self {
+        Self {
+            service,
+            healthy,
+            latency,
+            checked_at: std::time::Instant::now(),
+        }
+    }
+}
+
+fn auto_refresh_due(
+    enabled: bool,
+    mode: &Mode,
+    filter_active: bool,
+    loading: bool,
+    elapsed: std::time::Duration,
+) -> bool {
+    enabled
+        && mode == &Mode::Normal
+        && !filter_active
+        && !loading
+        && elapsed >= AUTO_REFRESH_INTERVAL
+}
+
+/// SSM Connect request data
+#[derive(Debug, Clone)]
+pub struct SsmConnectRequest {
+    pub instance_id: String,
+    pub region: String,
+    pub profile: String,
+}
+
+/// Pagination state for resource listings
+#[derive(Debug, Clone)]
+pub struct PaginationState {
+    /// Token for fetching next page (None if no more pages)
+    pub next_token: Option<String>,
+    /// Stack of previous page tokens for going back
+    pub token_stack: Vec<Option<String>>,
+    /// Current page number (1-indexed for display)
+    pub current_page: usize,
+    /// Whether there are more pages available
+    pub has_more: bool,
+}
+
+impl Default for PaginationState {
+    fn default() -> Self {
+        Self {
+            next_token: None,
+            token_stack: Vec::new(),
+            current_page: 1,
+            has_more: false,
+        }
+    }
+}
+
+/// SSO Login dialog state
+#[derive(Debug, Clone)]
+pub enum SsoLoginState {
+    /// Prompt to start login
+    Prompt {
+        profile: String,
+        sso_session: String,
+    },
+    /// Waiting for browser auth
+    WaitingForAuth {
+        profile: String,
+        user_code: String,
+        verification_uri: String,
+        #[allow(dead_code)]
+        device_code: String,
+        #[allow(dead_code)]
+        interval: u64,
+        #[allow(dead_code)]
+        sso_region: String,
+    },
+    /// Login succeeded - contains profile to switch to
+    Success { profile: String },
+    /// Login failed
+    Failed { error: String },
+}
+
+/// State for console login (aws login) dialog
+#[derive(Debug, Clone)]
+pub enum ConsoleLoginState {
+    /// Prompt to run aws login
+    Prompt {
+        profile: String,
+        login_session: String,
+    },
+    /// Waiting for browser auth (subprocess running)
+    WaitingForAuth {
+        profile: String,
+        login_session: String,
+        /// URL captured from subprocess output (displayed in dialog)
+        url: Option<String>,
+    },
+    /// Login succeeded - contains profile to switch to
+    Success { profile: String },
+    /// Login failed
+    Failed { profile: String, error: String },
+}
+
+/// Result of profile switch attempt
+#[derive(Debug, Clone)]
+pub enum ProfileSwitchResult {
+    /// Profile switched successfully
+    Success,
+    /// SSO login required for this profile (IAM Identity Center)
+    SsoRequired {
+        profile: String,
+        sso_session: String,
+    },
+    /// Console login required for this profile (aws login)
+    ConsoleLoginRequired {
+        profile: String,
+        login_session: String,
+    },
+}
+
+/// A single log event from CloudWatch
+#[derive(Debug, Clone)]
+pub struct LogEvent {
+    pub timestamp: i64,
+    pub message: String,
+}
+
+/// State for log tailing mode
+#[derive(Debug, Clone)]
+pub struct LogTailState {
+    /// Log group name
+    pub log_group: String,
+    /// Log stream name
+    pub log_stream: String,
+    /// Collected log events (max 1000)
+    pub events: Vec<LogEvent>,
+    /// Scroll position in the log view
+    pub scroll: usize,
+    /// Token for fetching next batch of events
+    pub next_forward_token: Option<String>,
+    /// Whether to auto-scroll to bottom on new events
+    pub auto_scroll: bool,
+    /// Whether polling is paused
+    pub paused: bool,
+    /// Last time we polled for new events
+    pub last_poll: std::time::Instant,
+    /// Error message if polling failed
+    pub error: Option<String>,
+}
+
+impl App {
+    /// Create App from pre-initialized components (used with splash screen)
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_initialized(
+        clients: AwsClients,
+        profile: String,
+        region: String,
+        available_profiles: Vec<String>,
+        available_regions: Vec<String>,
+        initial_items: Vec<Value>,
+        config: Config,
+        readonly: bool,
+        endpoint_url: Option<String>,
+    ) -> Self {
+        let filtered_items = initial_items.clone();
+
+        Self {
+            clients,
+            current_resource_key: "ec2-instances".to_string(),
+            items: initial_items,
+            filtered_items,
+            selected: 0,
+            mode: Mode::Normal,
+            filter_text: String::new(),
+            filter_active: false,
+            aws_filters: None,
+            filters_autocomplete_shown: false,
+            parent_context: None,
+            navigation_stack: Vec::new(),
+            command_text: String::new(),
+            command_suggestions: Vec::new(),
+            command_suggestion_selected: 0,
+            command_preview: None,
+            profile,
+            region,
+            available_profiles,
+            available_regions,
+            profiles_selected: 0,
+            regions_selected: 0,
+            pending_action: None,
+            loading: false,
+            error_message: None,
+            status_message: None,
+            describe_scroll: 0,
+            describe_data: None,
+            last_action_display_name: None,
+            describe_search_text: String::new(),
+            describe_search_active: false,
+            describe_match_lines: Vec::new(),
+            describe_current_match: 0,
+            auto_refresh_enabled: true,
+            last_refresh: std::time::Instant::now(),
+            api_health_check: None,
+            config,
+            last_key_press: None,
+            readonly,
+            warning_message: None,
+            endpoint_url,
+            sso_state: None,
+            console_login_state: None,
+            console_login_child: None,
+            console_login_rx: None,
+            pagination: PaginationState::default(),
+            log_tail_state: None,
+            ssm_connect_request: None,
+            fuzzy_matcher: SkimMatcherV2::default().ignore_case(),
+        }
+    }
+
+    /// Check whether the active resource should be refreshed automatically.
+    pub fn needs_refresh(&self) -> bool {
+        auto_refresh_due(
+            self.auto_refresh_enabled,
+            &self.mode,
+            self.filter_active,
+            self.loading,
+            self.last_refresh.elapsed(),
+        )
+    }
+
+    /// Reset refresh timer
+    pub fn mark_refreshed(&mut self) {
+        self.last_refresh = std::time::Instant::now();
+    }
+
+    pub fn toggle_monitoring(&mut self) {
+        self.auto_refresh_enabled = !self.auto_refresh_enabled;
+        self.mark_refreshed();
+    }
+
+    pub fn record_api_health_check(
+        &mut self,
+        service: String,
+        healthy: bool,
+        latency: std::time::Duration,
+    ) {
+        self.api_health_check = Some(ApiHealthCheck::from_request(service, healthy, latency));
+    }
+
+    // =========================================================================
+    // Resource Definition Access
+    // =========================================================================
+
+    /// Get current resource definition
+    pub fn current_resource(&self) -> Option<&'static ResourceDef> {
+        get_resource(&self.current_resource_key)
+    }
+
+    /// Get available commands for autocomplete
+    pub fn get_available_commands(&self) -> Vec<String> {
+        let mut commands: Vec<String> = get_all_resource_keys()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Add profiles and regions commands
+        commands.push("profiles".to_string());
+        commands.push("regions".to_string());
+        commands.push("monitor".to_string());
+
+        commands.sort();
+        commands
+    }
+
+    // =========================================================================
+    // Data Fetching
+    // =========================================================================
+
+    /// Fetch data for current resource (first page or current page based on pagination state)
+    pub async fn refresh_current(&mut self) -> Result<()> {
+        // Fetch the current page (uses pagination.next_token if set by next_page/prev_page)
+        self.fetch_page(self.pagination.next_token.clone()).await
+    }
+
+    /// Fetch a specific page of resources
+    async fn fetch_page(&mut self, page_token: Option<String>) -> Result<()> {
+        if self.current_resource().is_none() {
+            self.error_message = Some(format!("Unknown resource: {}", self.current_resource_key));
+            return Ok(());
+        }
+
+        self.loading = true;
+        self.error_message = None;
+
+        // Build filters from parent context
+        let filters = self.build_filters_from_context();
+        let service = self
+            .current_resource()
+            .map(|resource| resource.service.clone())
+            .unwrap_or_default();
+        let check_started = std::time::Instant::now();
+
+        // Use paginated fetch - returns only one page of results
+        match fetch_resources_paginated(
+            &self.current_resource_key,
+            &self.clients,
+            &filters,
+            page_token.as_deref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                self.record_api_health_check(service, true, check_started.elapsed());
+
+                // Preserve selection if possible
+                let prev_selected = self.selected;
+                self.items = result.items;
+                self.apply_filter();
+
+                // Update pagination state
+                self.pagination.has_more = result.next_token.is_some();
+                self.pagination.next_token = result.next_token;
+
+                // Try to keep the same selection index
+                if prev_selected < self.filtered_items.len() {
+                    self.selected = prev_selected;
+                } else {
+                    self.selected = 0;
+                }
+            }
+            Err(e) => {
+                let error = aws::client::format_aws_error(&e);
+                self.record_api_health_check(service, false, check_started.elapsed());
+                self.error_message = Some(error);
+                // Clear items to prevent mismatch between current_resource_key and stale items
+                self.items.clear();
+                self.filtered_items.clear();
+                self.selected = 0;
+                self.pagination = PaginationState::default();
+            }
+        }
+
+        self.loading = false;
+        self.mark_refreshed();
+        Ok(())
+    }
+
+    /// Fetch next page of resources
+    pub async fn next_page(&mut self) -> Result<()> {
+        if !self.pagination.has_more {
+            return Ok(());
+        }
+
+        // Save current token to stack for going back
+        let current_token = self.pagination.next_token.clone();
+        self.pagination.token_stack.push(current_token.clone());
+        self.pagination.current_page += 1;
+
+        // Fetch next page
+        self.fetch_page(current_token).await
+    }
+
+    /// Fetch previous page of resources
+    pub async fn prev_page(&mut self) -> Result<()> {
+        if self.pagination.current_page <= 1 {
+            return Ok(());
+        }
+
+        // Pop the previous token from stack
+        self.pagination.token_stack.pop(); // Remove current page's token
+        let prev_token = self.pagination.token_stack.pop().flatten(); // Get previous page's token
+        self.pagination.current_page -= 1;
+
+        // Fetch previous page
+        self.fetch_page(prev_token).await
+    }
+
+    /// Reset pagination state (call when navigating to new resource)
+    pub fn reset_pagination(&mut self) {
+        self.pagination = PaginationState::default();
+    }
+
+    /// Build AWS filters from parent context and AWS API filters
+    /// For S3, this collects both bucket_names and prefix from navigation stack
+    fn build_filters_from_context(&self) -> Vec<ResourceFilter> {
+        let mut filters = Vec::new();
+
+        // Add AWS API filters if present (unified filter system)
+        if let Some(ref aws_filters) = self.aws_filters {
+            for (key, value) in &aws_filters.filters {
+                // Special handling for "owner" - uses Owner.N param, not Filter
+                if key.to_lowercase() == "owner" {
+                    filters.push(ResourceFilter::new(
+                        &format!("owner:{}", value),
+                        vec![value.clone()],
+                    ));
+                } else if key.starts_with("tag:") {
+                    // Tag filters: tag:Key=Value -> Filter.N.Name=tag:Key, Filter.N.Value.1=Value
+                    filters.push(ResourceFilter::new(key, vec![value.clone()]));
+                } else {
+                    // Regular filters: key=value -> Filter.N.Name=key, Filter.N.Value.1=value
+                    filters.push(ResourceFilter::new(
+                        &format!("filter:{}", key),
+                        vec![value.clone()],
+                    ));
+                }
+            }
+        }
+
+        let Some(parent) = &self.parent_context else {
+            return filters;
+        };
+
+        let Some(_resource) = self.current_resource() else {
+            return filters;
+        };
+
+        // For S3 objects, we need to collect filters from entire navigation stack
+        // to preserve bucket_names while adding prefix
+        if self.current_resource_key == "s3-objects" {
+            // First, check navigation stack for bucket_names (from s3-buckets -> s3-objects)
+            for ctx in &self.navigation_stack {
+                if ctx.resource_key == "s3-buckets" {
+                    if let Some(parent_resource) = get_resource(&ctx.resource_key) {
+                        for sub in &parent_resource.sub_resources {
+                            if sub.resource_key == "s3-objects" {
+                                let bucket_name =
+                                    extract_json_value(&ctx.item, &sub.parent_id_field);
+                                if bucket_name != "-" {
+                                    filters.push(ResourceFilter::new(
+                                        &sub.filter_param,
+                                        vec![bucket_name],
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If parent is s3-buckets, get bucket_names from it
+            if parent.resource_key == "s3-buckets" {
+                if let Some(parent_resource) = get_resource(&parent.resource_key) {
+                    for sub in &parent_resource.sub_resources {
+                        if sub.resource_key == "s3-objects" {
+                            let bucket_name =
+                                extract_json_value(&parent.item, &sub.parent_id_field);
+                            if bucket_name != "-" {
+                                filters.push(ResourceFilter::new(
+                                    &sub.filter_param,
+                                    vec![bucket_name],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If parent is s3-objects (folder navigation), get prefix from it
+            if parent.resource_key == "s3-objects" {
+                // Check if selected item is a folder
+                let is_folder = parent
+                    .item
+                    .get("IsFolder")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if is_folder {
+                    let prefix = extract_json_value(&parent.item, "Key");
+                    if prefix != "-" {
+                        filters.push(ResourceFilter::new("prefix", vec![prefix]));
+                    }
+                }
+            }
+
+            return filters;
+        }
+
+        // Default behavior for other resources
+        if let Some(parent_resource) = get_resource(&parent.resource_key) {
+            for sub in &parent_resource.sub_resources {
+                if sub.resource_key == self.current_resource_key {
+                    // Extract parent ID value
+                    let parent_id = extract_json_value(&parent.item, &sub.parent_id_field);
+                    if parent_id != "-" {
+                        return vec![ResourceFilter::with_type(
+                            &sub.filter_param,
+                            vec![parent_id],
+                            &sub.filter_type,
+                        )];
+                    }
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    // =========================================================================
+    // Filtering
+    // =========================================================================
+
+    /// Apply text filter to items
+    /// Searches across all visible column values (name, id, and all other attributes)
+    pub fn apply_filter(&mut self) {
+        let query = self.filter_text.trim();
+
+        if query.is_empty() {
+            self.filtered_items = self.items.clone();
+        } else {
+            let resource = self.current_resource();
+
+            // Collect items with their match scores
+            let mut scored_items: Vec<(i64, Value)> = self
+                .items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(res) = resource {
+                        // Search across all column values (visible attributes)
+                        let mut best_score: Option<i64> = None;
+
+                        for col in &res.columns {
+                            let value = extract_json_value(item, &col.json_path);
+                            if let Some(score) = self.fuzzy_matcher.fuzzy_match(&value, query) {
+                                best_score = Some(best_score.map_or(score, |s| s.max(score)));
+                            }
+                        }
+
+                        // Also search name_field and id_field if not already in columns
+                        let name = extract_json_value(item, &res.name_field);
+                        if let Some(score) = self.fuzzy_matcher.fuzzy_match(&name, query) {
+                            best_score = Some(best_score.map_or(score, |s| s.max(score)));
+                        }
+
+                        let id = extract_json_value(item, &res.id_field);
+                        if let Some(score) = self.fuzzy_matcher.fuzzy_match(&id, query) {
+                            best_score = Some(best_score.map_or(score, |s| s.max(score)));
+                        }
+
+                        best_score.map(|score| (score, item.clone()))
+                    } else {
+                        // Fallback: search in JSON string
+                        self.fuzzy_matcher
+                            .fuzzy_match(&item.to_string(), query)
+                            .map(|score| (score, item.clone()))
+                    }
+                })
+                .collect();
+
+            // Sort by score descending (higher score = better match)
+            scored_items.sort_by_key(|b| std::cmp::Reverse(b.0));
+
+            // Extract just the items
+            self.filtered_items = scored_items.into_iter().map(|(_, item)| item).collect();
+        }
+
+        // Adjust selection
+        if self.selected >= self.filtered_items.len() && !self.filtered_items.is_empty() {
+            self.selected = self.filtered_items.len() - 1;
+        }
+    }
+
+    /// Start a new filter, clearing any existing AWS filters
+    /// Returns true if a refresh is needed (filters were cleared)
+    pub fn start_new_filter(&mut self) -> bool {
+        let needs_refresh = self.aws_filters.is_some();
+        self.filter_text.clear();
+        self.aws_filters = None;
+        self.filters_autocomplete_shown = false;
+        self.filter_active = true;
+        if needs_refresh {
+            self.reset_pagination();
+        }
+        needs_refresh
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter_text.clear();
+        self.filter_active = false;
+        self.aws_filters = None;
+        self.filters_autocomplete_shown = false;
+        self.apply_filter();
+    }
+
+    /// Check if the current resource supports filtering via AWS API
+    pub fn current_resource_supports_filters(&self) -> bool {
+        self.current_resource()
+            .map(|r| r.supports_filters())
+            .unwrap_or(false)
+    }
+
+    /// Get filter hint for current resource
+    pub fn current_resource_filters_hint(&self) -> Option<String> {
+        self.current_resource()
+            .and_then(|r| r.filters_hint().map(|s| s.to_string()))
+    }
+
+    /// Check if filter text should trigger filters autocomplete (just "F" or "Fi" or "Filters")
+    pub fn should_show_filters_autocomplete(&self) -> bool {
+        if !self.current_resource_supports_filters() {
+            return false;
+        }
+        let text = self.filter_text.trim().to_lowercase();
+        !text.is_empty() && "filters:".starts_with(&text) && !text.contains(':')
+    }
+
+    /// Clear AWS filters and refresh
+    pub async fn clear_aws_filters(&mut self) -> anyhow::Result<()> {
+        if self.aws_filters.is_some() {
+            self.aws_filters = None;
+            self.reset_pagination();
+            self.refresh_current().await?;
+        }
+        Ok(())
+    }
+
+    /// Get a display string for the current AWS filters
+    pub fn aws_filters_display(&self) -> Option<String> {
+        self.aws_filters.as_ref().map(|f| f.display())
+    }
+
+    // =========================================================================
+    // Navigation
+    // =========================================================================
+
+    #[allow(dead_code)]
+    pub fn current_list_len(&self) -> usize {
+        self.filtered_items.len()
+    }
+
+    pub fn selected_item(&self) -> Option<&Value> {
+        self.filtered_items.get(self.selected)
+    }
+
+    pub fn selected_item_json(&self) -> Option<String> {
+        // Use describe_data if available (full details), otherwise fall back to list data
+        if let Some(ref data) = self.describe_data {
+            return Some(serde_json::to_string_pretty(data).unwrap_or_default());
+        }
+        self.selected_item()
+            .map(|item| serde_json::to_string_pretty(item).unwrap_or_default())
+    }
+
+    /// Get the number of lines in the describe content
+    pub fn describe_line_count(&self) -> usize {
+        self.selected_item_json()
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Get the maximum scroll position for describe view
+    /// Uses an estimate of visible lines since we don't have access to terminal size here
+    fn describe_max_scroll(&self) -> usize {
+        let total = self.describe_line_count();
+        // Estimate ~40 visible lines (typical terminal height minus headers/footers)
+        let visible_estimate = 40;
+        total.saturating_sub(visible_estimate)
+    }
+
+    /// Scroll describe view down by amount, clamped to max
+    pub fn describe_scroll_down(&mut self, amount: usize) {
+        let max_scroll = self.describe_max_scroll();
+        self.describe_scroll = self.describe_scroll.saturating_add(amount).min(max_scroll);
+    }
+
+    /// Scroll describe view up by amount
+    pub fn describe_scroll_up(&mut self, amount: usize) {
+        self.describe_scroll = self.describe_scroll.saturating_sub(amount);
+    }
+
+    /// Scroll describe view to bottom
+    pub fn describe_scroll_to_bottom(&mut self, visible_lines: usize) {
+        let total = self.describe_line_count();
+        self.describe_scroll = total.saturating_sub(visible_lines);
+    }
+
+    /// Clear describe search
+    pub fn clear_describe_search(&mut self) {
+        self.describe_search_text.clear();
+        self.describe_search_active = false;
+        self.describe_match_lines.clear();
+        self.describe_current_match = 0;
+    }
+
+    /// Update describe search matches
+    pub fn update_describe_search(&mut self) {
+        self.describe_match_lines.clear();
+        self.describe_current_match = 0;
+
+        if self.describe_search_text.is_empty() {
+            return;
+        }
+
+        let search_lower = self.describe_search_text.to_lowercase();
+
+        if let Some(json) = self.selected_item_json() {
+            for (line_num, line) in json.lines().enumerate() {
+                if line.to_lowercase().contains(&search_lower) {
+                    self.describe_match_lines.push(line_num);
+                }
+            }
+        }
+
+        // Jump to first match if found
+        if !self.describe_match_lines.is_empty() {
+            self.describe_scroll = self.describe_match_lines[0];
+        }
+    }
+
+    /// Jump to next search match
+    pub fn describe_next_match(&mut self) {
+        if self.describe_match_lines.is_empty() {
+            return;
+        }
+        self.describe_current_match =
+            (self.describe_current_match + 1) % self.describe_match_lines.len();
+        self.describe_scroll = self.describe_match_lines[self.describe_current_match];
+    }
+
+    /// Jump to previous search match
+    pub fn describe_prev_match(&mut self) {
+        if self.describe_match_lines.is_empty() {
+            return;
+        }
+        if self.describe_current_match == 0 {
+            self.describe_current_match = self.describe_match_lines.len() - 1;
+        } else {
+            self.describe_current_match -= 1;
+        }
+        self.describe_scroll = self.describe_match_lines[self.describe_current_match];
+    }
+
+    pub fn next(&mut self) {
+        match self.mode {
+            Mode::Profiles => {
+                if !self.available_profiles.is_empty() {
+                    self.profiles_selected =
+                        (self.profiles_selected + 1).min(self.available_profiles.len() - 1);
+                }
+            }
+            Mode::Regions => {
+                if !self.available_regions.is_empty() {
+                    self.regions_selected =
+                        (self.regions_selected + 1).min(self.available_regions.len() - 1);
+                }
+            }
+            _ => {
+                if !self.filtered_items.is_empty() {
+                    self.selected = (self.selected + 1).min(self.filtered_items.len() - 1);
+                }
+            }
+        }
+    }
+
+    pub fn previous(&mut self) {
+        match self.mode {
+            Mode::Profiles => {
+                self.profiles_selected = self.profiles_selected.saturating_sub(1);
+            }
+            Mode::Regions => {
+                self.regions_selected = self.regions_selected.saturating_sub(1);
+            }
+            _ => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn go_to_top(&mut self) {
+        match self.mode {
+            Mode::Profiles => self.profiles_selected = 0,
+            Mode::Regions => self.regions_selected = 0,
+            _ => self.selected = 0,
+        }
+    }
+
+    pub fn go_to_bottom(&mut self) {
+        match self.mode {
+            Mode::Profiles => {
+                if !self.available_profiles.is_empty() {
+                    self.profiles_selected = self.available_profiles.len() - 1;
+                }
+            }
+            Mode::Regions => {
+                if !self.available_regions.is_empty() {
+                    self.regions_selected = self.available_regions.len() - 1;
+                }
+            }
+            _ => {
+                if !self.filtered_items.is_empty() {
+                    self.selected = self.filtered_items.len() - 1;
+                }
+            }
+        }
+    }
+
+    pub fn page_down(&mut self, page_size: usize) {
+        match self.mode {
+            Mode::Profiles => {
+                if !self.available_profiles.is_empty() {
+                    self.profiles_selected =
+                        (self.profiles_selected + page_size).min(self.available_profiles.len() - 1);
+                }
+            }
+            Mode::Regions => {
+                if !self.available_regions.is_empty() {
+                    self.regions_selected =
+                        (self.regions_selected + page_size).min(self.available_regions.len() - 1);
+                }
+            }
+            _ => {
+                if !self.filtered_items.is_empty() {
+                    self.selected = (self.selected + page_size).min(self.filtered_items.len() - 1);
+                }
+            }
+        }
+    }
+
+    pub fn page_up(&mut self, page_size: usize) {
+        match self.mode {
+            Mode::Profiles => {
+                self.profiles_selected = self.profiles_selected.saturating_sub(page_size);
+            }
+            Mode::Regions => {
+                self.regions_selected = self.regions_selected.saturating_sub(page_size);
+            }
+            _ => {
+                self.selected = self.selected.saturating_sub(page_size);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Mode Transitions
+    // =========================================================================
+
+    pub fn enter_command_mode(&mut self) {
+        self.mode = Mode::Command;
+        self.command_text.clear();
+        self.command_suggestions = self.get_available_commands();
+        self.command_suggestion_selected = 0;
+        self.command_preview = None;
+    }
+
+    pub fn update_command_suggestions(&mut self) {
+        let input = self.command_text.to_lowercase();
+        let all_commands = self.get_available_commands();
+
+        if input.is_empty() {
+            self.command_suggestions = all_commands;
+        } else {
+            self.command_suggestions = all_commands
+                .into_iter()
+                .filter(|cmd| cmd.contains(&input))
+                .collect();
+        }
+
+        if self.command_suggestion_selected >= self.command_suggestions.len() {
+            self.command_suggestion_selected = 0;
+        }
+
+        // Update preview to show current selection
+        self.update_preview();
+    }
+
+    fn update_preview(&mut self) {
+        if self.command_suggestions.is_empty() {
+            self.command_preview = None;
+        } else {
+            self.command_preview = self
+                .command_suggestions
+                .get(self.command_suggestion_selected)
+                .cloned();
+        }
+    }
+
+    pub fn next_suggestion(&mut self) {
+        if !self.command_suggestions.is_empty() {
+            self.command_suggestion_selected =
+                (self.command_suggestion_selected + 1) % self.command_suggestions.len();
+            // Update preview (ghost text) without changing command_text
+            self.update_preview();
+        }
+    }
+
+    pub fn prev_suggestion(&mut self) {
+        if !self.command_suggestions.is_empty() {
+            if self.command_suggestion_selected == 0 {
+                self.command_suggestion_selected = self.command_suggestions.len() - 1;
+            } else {
+                self.command_suggestion_selected -= 1;
+            }
+            // Update preview (ghost text) without changing command_text
+            self.update_preview();
+        }
+    }
+
+    pub fn apply_suggestion(&mut self) {
+        // Apply the preview to command_text (on Tab/Right)
+        if let Some(preview) = &self.command_preview {
+            self.command_text = preview.clone();
+            self.update_command_suggestions();
+        }
+    }
+
+    pub fn enter_help_mode(&mut self) {
+        self.mode = Mode::Help;
+    }
+
+    pub async fn enter_describe_mode(&mut self) {
+        if self.filtered_items.is_empty() {
+            return;
+        }
+
+        self.mode = Mode::Describe;
+        self.describe_scroll = 0;
+        self.describe_data = None;
+
+        // Get the selected item's ID
+        if let Some(item) = self.selected_item().cloned() {
+            if let Some(resource_def) = self.current_resource() {
+                // Check if this resource has a detail_sdk_method defined
+                if let Some(ref detail_method) = resource_def.detail_sdk_method {
+                    // Build params from item data based on detail_sdk_method_params
+                    let mut params = serde_json::Map::new();
+                    if let Some(param_map) = resource_def.detail_sdk_method_params.as_object() {
+                        for (param_name, field_name) in param_map {
+                            if let Some(field) = field_name.as_str() {
+                                let value = crate::resource::extract_json_value(&item, field);
+                                params.insert(param_name.clone(), serde_json::Value::String(value));
+                            }
+                        }
+                    }
+
+                    // Call the detail SDK method
+                    match crate::resource::invoke_sdk(
+                        &resource_def.service,
+                        detail_method,
+                        &self.clients,
+                        &serde_json::Value::Object(params),
+                    )
+                    .await
+                    {
+                        Ok(data) => {
+                            self.describe_data = Some(data);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to fetch detail data via {}: {}",
+                                detail_method,
+                                e
+                            );
+                            self.describe_data = Some(item);
+                        }
+                    }
+                } else {
+                    // Fall back to existing describe_resource logic
+                    let id = crate::resource::extract_json_value(&item, &resource_def.id_field);
+                    if id != "-" && !id.is_empty() {
+                        match crate::resource::describe_resource(
+                            &self.current_resource_key,
+                            &self.clients,
+                            &id,
+                        )
+                        .await
+                        {
+                            Ok(data) => {
+                                self.describe_data = Some(data);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch describe data: {}", e);
+                                self.describe_data = Some(item);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enter confirmation mode for an action
+    pub fn enter_confirm_mode(&mut self, pending: PendingAction) {
+        self.pending_action = Some(pending);
+        self.mode = Mode::Confirm;
+    }
+
+    /// Show a warning modal with OK button
+    pub fn show_warning(&mut self, message: &str) {
+        self.warning_message = Some(message.to_string());
+        self.mode = Mode::Warning;
+    }
+
+    /// Enter SSO login mode to prompt for browser authentication
+    pub fn enter_sso_login_mode(&mut self, profile: &str, sso_session: &str) {
+        self.sso_state = Some(SsoLoginState::Prompt {
+            profile: profile.to_string(),
+            sso_session: sso_session.to_string(),
+        });
+        self.mode = Mode::SsoLogin;
+    }
+
+    pub fn enter_console_login_mode(&mut self, profile: &str, login_session: &str) {
+        self.console_login_state = Some(ConsoleLoginState::Prompt {
+            profile: profile.to_string(),
+            login_session: login_session.to_string(),
+        });
+        self.mode = Mode::ConsoleLogin;
+    }
+
+    /// Create a pending action from an ActionDef
+    pub fn create_pending_action(
+        &self,
+        action: &crate::resource::ActionDef,
+        resource_id: &str,
+    ) -> Option<PendingAction> {
+        let config = action.get_confirm_config()?;
+        let resource_name = self
+            .selected_item()
+            .and_then(|item| {
+                if let Some(resource_def) = self.current_resource() {
+                    let name = crate::resource::extract_json_value(item, &resource_def.name_field);
+                    if name != "-" && !name.is_empty() {
+                        return Some(name);
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| resource_id.to_string());
+
+        let message = config
+            .message
+            .unwrap_or_else(|| action.display_name.clone());
+        let default_no = !config.default_yes;
+
+        Some(PendingAction {
+            service: self.current_resource()?.service.clone(),
+            sdk_method: action.sdk_method.clone(),
+            resource_id: resource_id.to_string(),
+            message: format!("{} '{}'?", message, resource_name),
+            default_no,
+            destructive: config.destructive,
+            selected_yes: config.default_yes, // Start with default selection
+        })
+    }
+
+    pub fn enter_profiles_mode(&mut self) {
+        self.profiles_selected = self
+            .available_profiles
+            .iter()
+            .position(|p| p == &self.profile)
+            .unwrap_or(0);
+        self.mode = Mode::Profiles;
+    }
+
+    pub fn enter_regions_mode(&mut self) {
+        self.regions_selected = self
+            .available_regions
+            .iter()
+            .position(|r| r == &self.region)
+            .unwrap_or(0);
+        self.mode = Mode::Regions;
+    }
+
+    pub fn exit_mode(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending_action = None;
+        self.describe_data = None; // Clear describe data when exiting
+        self.last_action_display_name = None;
+    }
+
+    /// Copy the primary value from the current action result view to the clipboard.
+    /// Only works when viewing an action result (e.g., after pressing 'x' to view a value).
+    /// For SSM parameters, copies the Parameter Value.
+    /// For Secrets Manager secrets, copies the SecretString.
+    pub fn copy_describe_value_to_clipboard(&mut self) {
+        // Only allow copy in action result views (not regular describe)
+        if self.last_action_display_name.is_none() {
+            return;
+        }
+
+        let Some(ref data) = self.describe_data else {
+            self.error_message = Some("No data to copy".to_string());
+            return;
+        };
+
+        let value_to_copy = extract_copyable_value(&self.current_resource_key, data);
+
+        match value_to_copy {
+            Some(text) if !text.is_empty() => {
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+                    Ok(_) => {
+                        let label = if self.current_resource_key == "ssm-parameters" {
+                            "Parameter value"
+                        } else {
+                            "Secret value"
+                        };
+                        self.status_message = Some(format!("{} copied to clipboard", label));
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to copy to clipboard: {}", e));
+                    }
+                }
+            }
+            _ => {
+                self.error_message = Some("No value found to copy".to_string());
+            }
+        }
+    }
+
+    // =========================================================================
+    // Resource Navigation
+    // =========================================================================
+
+    /// Navigate to a resource (top-level)
+    pub async fn navigate_to_resource(&mut self, resource_key: &str) -> Result<()> {
+        if get_resource(resource_key).is_none() {
+            self.error_message = Some(format!("Unknown resource: {}", resource_key));
+            return Ok(());
+        }
+
+        // Clear parent context when navigating to top-level resource
+        self.parent_context = None;
+        self.navigation_stack.clear();
+        self.current_resource_key = resource_key.to_string();
+        self.selected = 0;
+        self.filter_text.clear();
+        self.filter_active = false;
+        self.mode = Mode::Normal;
+
+        // Reset pagination for new resource
+        self.reset_pagination();
+
+        self.refresh_current().await?;
+        Ok(())
+    }
+
+    /// Navigate to sub-resource with parent context
+    pub async fn navigate_to_sub_resource(&mut self, sub_resource_key: &str) -> Result<()> {
+        let Some(selected_item) = self.selected_item().cloned() else {
+            return Ok(());
+        };
+
+        let Some(current_resource) = self.current_resource() else {
+            return Ok(());
+        };
+
+        // Verify this is a valid sub-resource
+        let is_valid = current_resource
+            .sub_resources
+            .iter()
+            .any(|s| s.resource_key == sub_resource_key);
+
+        if !is_valid {
+            self.error_message = Some(format!(
+                "{} is not a sub-resource of {}",
+                sub_resource_key, self.current_resource_key
+            ));
+            return Ok(());
+        }
+
+        // Special handling for S3 folder navigation
+        // Only allow navigating into folders, not files
+        if self.current_resource_key == "s3-objects" && sub_resource_key == "s3-objects" {
+            let is_folder = selected_item
+                .get("IsFolder")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if !is_folder {
+                // Don't navigate into files - could show a message or do nothing
+                return Ok(());
+            }
+        }
+
+        // Get display name for parent
+        let display_name = extract_json_value(&selected_item, &current_resource.name_field);
+        let id = extract_json_value(&selected_item, &current_resource.id_field);
+        let display = if display_name != "-" {
+            display_name
+        } else {
+            id
+        };
+
+        // Push current context to stack
+        if let Some(ctx) = self.parent_context.take() {
+            self.navigation_stack.push(ctx);
+        }
+
+        // Set new parent context
+        self.parent_context = Some(ParentContext {
+            resource_key: self.current_resource_key.clone(),
+            item: selected_item,
+            display_name: display,
+            saved_selected: self.selected,
+        });
+
+        // Navigate
+        self.current_resource_key = sub_resource_key.to_string();
+        self.selected = 0;
+        self.filter_text.clear();
+        self.filter_active = false;
+
+        // Reset pagination for new resource
+        self.reset_pagination();
+
+        self.refresh_current().await?;
+        Ok(())
+    }
+
+    /// Navigate back to parent resource
+    pub async fn navigate_back(&mut self) -> Result<()> {
+        if let Some(parent) = self.parent_context.take() {
+            // Pop from navigation stack if available
+            self.parent_context = self.navigation_stack.pop();
+
+            // Navigate to parent resource
+            self.current_resource_key = parent.resource_key;
+            self.selected = parent.saved_selected;
+            self.filter_text.clear();
+            self.filter_active = false;
+
+            // Reset pagination for parent resource
+            self.reset_pagination();
+
+            self.refresh_current().await?;
+        }
+        Ok(())
+    }
+
+    /// Get breadcrumb path
+    pub fn get_breadcrumb(&self) -> Vec<String> {
+        let mut path = Vec::new();
+
+        for ctx in &self.navigation_stack {
+            path.push(format!("{}:{}", ctx.resource_key, ctx.display_name));
+        }
+
+        if let Some(ctx) = &self.parent_context {
+            path.push(format!("{}:{}", ctx.resource_key, ctx.display_name));
+        }
+
+        path.push(self.current_resource_key.clone());
+        path
+    }
+
+    // =========================================================================
+    // EC2 Actions (using SDK dispatcher)
+    // =========================================================================
+    // Profile/Region Switching
+    // =========================================================================
+
+    pub async fn switch_region(&mut self, region: &str) -> Result<()> {
+        let actual_region = self.clients.switch_region(&self.profile, region).await?;
+        self.region = actual_region.clone();
+
+        // Save to config (log errors but don't fail region switch)
+        if let Err(e) = self.config.set_region(&actual_region) {
+            tracing::warn!("Failed to save region to config: {}", e);
+        }
+
+        Ok(())
+    }
+
+    pub async fn switch_profile(&mut self, profile: &str) -> Result<()> {
+        let (new_clients, actual_region) =
+            AwsClients::new(profile, &self.region, self.endpoint_url.clone()).await?;
+        self.clients = new_clients;
+        self.profile = profile.to_string();
+        self.region = actual_region.clone();
+
+        // Save to config (log errors but don't fail profile switch)
+        if let Err(e) = self.config.set_profile(profile) {
+            tracing::warn!("Failed to save profile to config: {}", e);
+        }
+        if let Err(e) = self.config.set_region(&actual_region) {
+            tracing::warn!("Failed to save region to config: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Switch profile with SSO/Console login check - returns login required if needed
+    pub async fn switch_profile_with_sso_check(
+        &mut self,
+        profile: &str,
+    ) -> Result<ProfileSwitchResult> {
+        use crate::aws::client::ClientResult;
+
+        match AwsClients::new_with_sso_check(profile, &self.region, self.endpoint_url.clone())
+            .await?
+        {
+            ClientResult::Ok(new_clients, actual_region) => {
+                self.clients = new_clients;
+                self.profile = profile.to_string();
+                self.region = actual_region.clone();
+
+                // Save to config (log errors but don't fail profile switch)
+                if let Err(e) = self.config.set_profile(profile) {
+                    tracing::warn!("Failed to save profile to config: {}", e);
+                }
+                if let Err(e) = self.config.set_region(&actual_region) {
+                    tracing::warn!("Failed to save region to config: {}", e);
+                }
+
+                Ok(ProfileSwitchResult::Success)
+            }
+            ClientResult::SsoLoginRequired {
+                profile,
+                sso_session,
+                ..
+            } => Ok(ProfileSwitchResult::SsoRequired {
+                profile,
+                sso_session,
+            }),
+            ClientResult::ConsoleLoginRequired {
+                profile,
+                login_session,
+                ..
+            } => Ok(ProfileSwitchResult::ConsoleLoginRequired {
+                profile,
+                login_session,
+            }),
+        }
+    }
+
+    /// Select profile - returns true if login (SSO or Console) is required
+    pub async fn select_profile(&mut self) -> Result<bool> {
+        if let Some(profile) = self.available_profiles.get(self.profiles_selected) {
+            let profile = profile.clone();
+            match self.switch_profile_with_sso_check(&profile).await? {
+                ProfileSwitchResult::Success => {
+                    self.refresh_current().await?;
+                    self.exit_mode();
+                    Ok(false)
+                }
+                ProfileSwitchResult::SsoRequired {
+                    profile,
+                    sso_session,
+                } => {
+                    // Enter SSO login mode (IAM Identity Center)
+                    self.enter_sso_login_mode(&profile, &sso_session);
+                    Ok(true)
+                }
+                ProfileSwitchResult::ConsoleLoginRequired {
+                    profile,
+                    login_session,
+                } => {
+                    // Enter console login mode (aws login)
+                    self.enter_console_login_mode(&profile, &login_session);
+                    Ok(true)
+                }
+            }
+        } else {
+            self.exit_mode();
+            Ok(false)
+        }
+    }
+
+    pub async fn select_region(&mut self) -> Result<()> {
+        if let Some(region) = self.available_regions.get(self.regions_selected) {
+            let region = region.clone();
+            self.switch_region(&region).await?;
+            self.refresh_current().await?;
+        }
+        self.exit_mode();
+        Ok(())
+    }
+
+    // =========================================================================
+    // Command Execution
+    // =========================================================================
+
+    pub async fn execute_command(&mut self) -> Result<bool> {
+        // Use preview if user navigated to a suggestion, otherwise use typed text
+        let command_text = if self.command_text.is_empty() {
+            self.command_preview.clone().unwrap_or_default()
+        } else if let Some(preview) = &self.command_preview {
+            // If preview matches what would be completed, use preview
+            if preview.contains(&self.command_text) {
+                preview.clone()
+            } else {
+                self.command_text.clone()
+            }
+        } else {
+            self.command_text.clone()
+        };
+
+        let parts: Vec<&str> = command_text.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return Ok(false);
+        }
+
+        let cmd = parts[0];
+
+        match cmd {
+            "q" | "quit" => return Ok(true),
+            "back" => {
+                self.navigate_back().await?;
+            }
+            "profiles" => {
+                self.enter_profiles_mode();
+            }
+            "regions" => {
+                self.enter_regions_mode();
+            }
+            "monitor" if parts.len() == 1 => self.toggle_monitoring(),
+            "monitor" => self.error_message = Some("Usage: monitor".to_string()),
+            "region" if parts.len() > 1 => {
+                self.switch_region(parts[1]).await?;
+                self.refresh_current().await?;
+            }
+            "profile" if parts.len() > 1 => {
+                self.switch_profile(parts[1]).await?;
+                self.refresh_current().await?;
+            }
+            _ => {
+                // Check if it's a known resource
+                if let Some(target_resource) = get_resource(cmd) {
+                    // Check if the target resource requires a parent
+                    if target_resource.requires_parent {
+                        // Check if it's a sub-resource of current and we have a selected item
+                        if let Some(resource) = self.current_resource() {
+                            let is_sub =
+                                resource.sub_resources.iter().any(|s| s.resource_key == cmd);
+                            if is_sub && self.selected_item().is_some() {
+                                self.navigate_to_sub_resource(cmd).await?;
+                            } else {
+                                self.error_message = Some(format!(
+                                    "'{}' requires a parent resource. Navigate to the parent first and select an item.",
+                                    target_resource.display_name
+                                ));
+                            }
+                        } else {
+                            self.error_message = Some(format!(
+                                "'{}' requires a parent resource. Navigate to the parent first and select an item.",
+                                target_resource.display_name
+                            ));
+                        }
+                    } else {
+                        // Normal resource - check if it's a sub-resource of current
+                        if let Some(resource) = self.current_resource() {
+                            let is_sub =
+                                resource.sub_resources.iter().any(|s| s.resource_key == cmd);
+                            if is_sub && self.selected_item().is_some() {
+                                self.navigate_to_sub_resource(cmd).await?;
+                            } else {
+                                self.navigate_to_resource(cmd).await?;
+                            }
+                        } else {
+                            self.navigate_to_resource(cmd).await?;
+                        }
+                    }
+                } else {
+                    self.error_message = Some(format!("Unknown command: {}", cmd));
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    // =========================================================================
+    // Log Tail Mode
+    // =========================================================================
+
+    /// Enter log tail mode for the selected log stream
+    pub async fn enter_log_tail_mode(&mut self) -> Result<()> {
+        // Get the selected log stream item
+        let Some(item) = self.selected_item().cloned() else {
+            return Ok(());
+        };
+
+        // Extract log stream name from selected item
+        let log_stream = extract_json_value(&item, "logStreamName");
+
+        // Extract log group name from parent context (log group)
+        let log_group = self
+            .parent_context
+            .as_ref()
+            .map(|ctx| extract_json_value(&ctx.item, "logGroupName"))
+            .unwrap_or_else(|| "-".to_string());
+
+        if log_group == "-" || log_stream == "-" {
+            self.error_message = Some("Could not get log group/stream name".to_string());
+            return Ok(());
+        }
+
+        // Initialize log tail state
+        self.log_tail_state = Some(LogTailState {
+            log_group: log_group.clone(),
+            log_stream: log_stream.clone(),
+            events: Vec::new(),
+            scroll: 0,
+            next_forward_token: None,
+            auto_scroll: true,
+            paused: false,
+            last_poll: std::time::Instant::now(),
+            error: None,
+        });
+
+        self.mode = Mode::LogTail;
+
+        // Fetch initial log events
+        self.poll_log_events().await?;
+
+        Ok(())
+    }
+
+    /// Poll for new log events
+    pub async fn poll_log_events(&mut self) -> Result<()> {
+        let Some(ref mut state) = self.log_tail_state else {
+            return Ok(());
+        };
+
+        if state.paused {
+            return Ok(());
+        }
+
+        // Build params for get_log_events
+        let mut params = serde_json::json!({
+            "log_group_name": [state.log_group.clone()],
+            "log_stream_name": [state.log_stream.clone()],
+        });
+
+        if let Some(ref token) = state.next_forward_token {
+            params["next_forward_token"] = serde_json::json!(token);
+        }
+
+        // Call the SDK
+        match crate::resource::invoke_sdk(
+            "cloudwatchlogs",
+            "get_log_events",
+            &self.clients,
+            &params,
+        )
+        .await
+        {
+            Ok(response) => {
+                state.error = None;
+
+                // Extract events
+                if let Some(events) = response
+                    .get("events")
+                    .and_then(|v: &serde_json::Value| v.as_array())
+                {
+                    for event in events {
+                        let timestamp = event
+                            .get("timestamp")
+                            .and_then(|v: &serde_json::Value| v.as_i64())
+                            .unwrap_or(0);
+                        let message = event
+                            .get("message")
+                            .and_then(|v: &serde_json::Value| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        state.events.push(LogEvent { timestamp, message });
+                    }
+
+                    // Keep only last 1000 events
+                    if state.events.len() > 1000 {
+                        let drain_count = state.events.len() - 1000;
+                        state.events.drain(0..drain_count);
+                    }
+                }
+
+                // Update next forward token
+                if let Some(token) = response.get("nextForwardToken").and_then(|v| v.as_str()) {
+                    state.next_forward_token = Some(token.to_string());
+                }
+
+                // Auto-scroll to bottom if enabled
+                if state.auto_scroll && !state.events.is_empty() {
+                    state.scroll = state.events.len().saturating_sub(1);
+                }
+            }
+            Err(e) => {
+                state.error = Some(format!("Failed to fetch logs: {}", e));
+            }
+        }
+
+        state.last_poll = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Toggle pause state for log tailing
+    pub fn toggle_log_tail_pause(&mut self) {
+        if let Some(ref mut state) = self.log_tail_state {
+            state.paused = !state.paused;
+        }
+    }
+
+    /// Scroll log tail view up
+    pub fn log_tail_scroll_up(&mut self, amount: usize) {
+        if let Some(ref mut state) = self.log_tail_state {
+            state.scroll = state.scroll.saturating_sub(amount);
+            state.auto_scroll = false;
+        }
+    }
+
+    /// Scroll log tail view down
+    pub fn log_tail_scroll_down(&mut self, amount: usize) {
+        if let Some(ref mut state) = self.log_tail_state {
+            let max_scroll = state.events.len().saturating_sub(1);
+            state.scroll = (state.scroll + amount).min(max_scroll);
+        }
+    }
+
+    /// Scroll log tail view to top
+    pub fn log_tail_scroll_to_top(&mut self) {
+        if let Some(ref mut state) = self.log_tail_state {
+            state.scroll = 0;
+            state.auto_scroll = false;
+        }
+    }
+
+    /// Scroll log tail view to bottom and enable auto-scroll
+    pub fn log_tail_scroll_to_bottom(&mut self) {
+        if let Some(ref mut state) = self.log_tail_state {
+            state.scroll = state.events.len().saturating_sub(1);
+            state.auto_scroll = true;
+        }
+    }
+
+    /// Exit log tail mode
+    pub fn exit_log_tail_mode(&mut self) {
+        self.log_tail_state = None;
+        self.mode = Mode::Normal;
+    }
+
+    // =========================================================================
+    // SSM Connect
+    // =========================================================================
+
+    /// Request SSM connect to the selected EC2 instance
+    /// Returns true if a connect request was made, false otherwise
+    pub fn request_ssm_connect(&mut self) -> bool {
+        // Get the selected item
+        let Some(item) = self.selected_item().cloned() else {
+            return false;
+        };
+
+        // Extract instance ID
+        let instance_id = extract_json_value(&item, "InstanceId");
+        if instance_id == "-" || instance_id.is_empty() {
+            self.show_warning("Could not get instance ID");
+            return false;
+        }
+
+        // Check if instance is running
+        let state = extract_json_value(&item, "State");
+        if state != "running" {
+            self.show_warning(&format!(
+                "Cannot connect: instance is '{}'. Instance must be running.",
+                state
+            ));
+            return false;
+        }
+
+        // Check if session-manager-plugin is installed
+        if !Self::is_ssm_plugin_installed() {
+            self.show_warning("session-manager-plugin is not installed.\n\nhttps://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html");
+            return false;
+        }
+
+        // Set the connect request - will be handled by main loop
+        self.ssm_connect_request = Some(SsmConnectRequest {
+            instance_id,
+            region: self.region.clone(),
+            profile: self.profile.clone(),
+        });
+
+        true
+    }
+
+    /// Check if session-manager-plugin is installed
+    fn is_ssm_plugin_installed() -> bool {
+        std::process::Command::new("session-manager-plugin")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Take the SSM connect request (clears it)
+    pub fn take_ssm_connect_request(&mut self) -> Option<SsmConnectRequest> {
+        self.ssm_connect_request.take()
+    }
+}
+
+/// Extract the copyable value from describe data based on resource type.
+/// Returns None for unsupported resource types.
+fn extract_copyable_value(resource_key: &str, data: &Value) -> Option<String> {
+    match resource_key {
+        "ssm-parameters" => {
+            // SSM GetParameter response: { "Parameter": { "Value": "..." } }
+            data.pointer("/Parameter/Value")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }
+        "secretsmanager-secrets" => {
+            // GetSecretValue response: { "SecretString": "..." }
+            data.pointer("/SecretString")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_refresh_runs_only_when_enabled_and_idle_in_normal_mode() {
+        assert!(auto_refresh_due(
+            true,
+            &Mode::Normal,
+            false,
+            false,
+            AUTO_REFRESH_INTERVAL
+        ));
+        assert!(!auto_refresh_due(
+            false,
+            &Mode::Normal,
+            false,
+            false,
+            AUTO_REFRESH_INTERVAL * 2
+        ));
+        assert!(!auto_refresh_due(
+            true,
+            &Mode::Describe,
+            false,
+            false,
+            AUTO_REFRESH_INTERVAL * 2
+        ));
+        assert!(!auto_refresh_due(
+            true,
+            &Mode::Normal,
+            true,
+            false,
+            AUTO_REFRESH_INTERVAL * 2
+        ));
+        assert!(!auto_refresh_due(
+            true,
+            &Mode::Normal,
+            false,
+            true,
+            AUTO_REFRESH_INTERVAL * 2
+        ));
+        assert!(!auto_refresh_due(
+            true,
+            &Mode::Normal,
+            false,
+            false,
+            AUTO_REFRESH_INTERVAL - std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn api_health_check_records_request_outcome_and_latency() {
+        let latency = std::time::Duration::from_millis(5);
+        let healthy = ApiHealthCheck::from_request("ec2".to_string(), true, latency);
+        assert_eq!(healthy.service, "ec2");
+        assert!(healthy.healthy);
+        assert_eq!(healthy.latency, latency);
+
+        let failed = ApiHealthCheck::from_request(
+            "logs".to_string(),
+            false,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(failed.service, "logs");
+        assert!(!failed.healthy);
+        assert_eq!(failed.latency, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_parse_aws_filters_valid() {
+        let result = AwsFilters::parse("Filters: owner=amazon, architecture=arm64");
+        assert!(result.is_some());
+        let filters = result.unwrap();
+        assert_eq!(filters.filters.len(), 2);
+        assert_eq!(
+            filters.filters[0],
+            ("owner".to_string(), "amazon".to_string())
+        );
+        assert_eq!(
+            filters.filters[1],
+            ("architecture".to_string(), "arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_filters_lowercase() {
+        let result = AwsFilters::parse("filters: state=available");
+        assert!(result.is_some());
+        let filters = result.unwrap();
+        assert_eq!(filters.filters.len(), 1);
+        assert_eq!(
+            filters.filters[0],
+            ("state".to_string(), "available".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_filters_with_tag() {
+        let result = AwsFilters::parse("Filters: tag:Environment=prod");
+        assert!(result.is_some());
+        let filters = result.unwrap();
+        assert_eq!(filters.filters.len(), 1);
+        assert_eq!(
+            filters.filters[0],
+            ("tag:Environment".to_string(), "prod".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_filters_invalid_no_value() {
+        let result = AwsFilters::parse("Filters: owner=");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_aws_filters_invalid_no_key() {
+        let result = AwsFilters::parse("Filters: =amazon");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_aws_filters_not_filters_prefix() {
+        let result = AwsFilters::parse("owner=amazon");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aws_filters_display() {
+        let filters = AwsFilters {
+            filters: vec![
+                ("owner".to_string(), "amazon".to_string()),
+                ("architecture".to_string(), "arm64".to_string()),
+            ],
+        };
+        assert_eq!(
+            filters.display(),
+            "Filters: owner=amazon, architecture=arm64"
+        );
+    }
+
+    #[test]
+    fn test_extract_copyable_value_ssm_parameter() {
+        let data = serde_json::json!({
+            "Parameter": {
+                "Name": "/app/config-key",
+                "Type": "SecureString",
+                "Value": "fake-data",
+                "Version": 1
+            }
+        });
+        let result = extract_copyable_value("ssm-parameters", &data);
+        assert_eq!(result, Some("fake-data".to_string()));
+    }
+
+    #[test]
+    fn test_extract_copyable_value_secretsmanager() {
+        let data = serde_json::json!({
+            "ARN": "arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret",
+            "Name": "my-secret",
+            "SecretString": "{\"key\":\"fake-data\"}",
+            "VersionId": "abc-123"
+        });
+        let result = extract_copyable_value("secretsmanager-secrets", &data);
+        assert_eq!(result, Some("{\"key\":\"fake-data\"}".to_string()));
+    }
+
+    #[test]
+    fn test_extract_copyable_value_unsupported_resource() {
+        let data = serde_json::json!({"InstanceId": "i-12345"});
+        let result = extract_copyable_value("ec2-instances", &data);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_copyable_value_ssm_missing_value_field() {
+        let data = serde_json::json!({
+            "Parameter": {
+                "Name": "/app/config",
+                "Type": "String"
+            }
+        });
+        let result = extract_copyable_value("ssm-parameters", &data);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_copyable_value_secret_missing_secret_string() {
+        let data = serde_json::json!({
+            "ARN": "arn:aws:secretsmanager:us-east-1:123456789:secret:binary-secret",
+            "Name": "binary-secret",
+            "SecretBinary": "base64data"
+        });
+        let result = extract_copyable_value("secretsmanager-secrets", &data);
+        assert_eq!(result, None);
+    }
+}

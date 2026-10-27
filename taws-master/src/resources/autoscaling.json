@@ -1,0 +1,50 @@
+{
+  "resources": {
+    "autoscaling-groups": {
+      "display_name": "Auto Scaling Groups",
+      "service": "autoscaling",
+      "sdk_method": "describe_auto_scaling_groups",
+      "sdk_method_params": {},
+      "response_path": "auto_scaling_groups",
+      "id_field": "AutoScalingGroupName",
+      "name_field": "AutoScalingGroupName",
+      "is_global": false,
+      "columns": [
+        { "header": "GROUP NAME", "json_path": "AutoScalingGroupName", "width": 35 },
+        { "header": "DESIRED", "json_path": "DesiredCapacity", "width": 10 },
+        { "header": "MIN", "json_path": "MinSize", "width": 6 },
+        { "header": "MAX", "json_path": "MaxSize", "width": 6 },
+        { "header": "INSTANCES", "json_path": "InstanceCount", "width": 12 },
+        { "header": "AZ", "json_path": "AvailabilityZones", "width": 20 }
+      ],
+      "sub_resources": [],
+      "actions": [
+        { "key": "ctrl+d", "display_name": "Delete Group", "shortcut": "ctrl+d", "sdk_method": "delete_auto_scaling_group", "confirm": { "message": "Delete Auto Scaling group", "default_yes": false, "destructive": true } }
+      ],
+      "api_config": {
+        "protocol": "query",
+        "action": "DescribeAutoScalingGroups",
+        "response_root": "/DescribeAutoScalingGroupsResponse/DescribeAutoScalingGroupsResult/AutoScalingGroups/member"
+      },
+      "field_mappings": {
+        "AutoScalingGroupName": { "source": "/AutoScalingGroupName", "default": "-" },
+        "MinSize": { "source": "/MinSize", "default": "0" },
+        "MaxSize": { "source": "/MaxSize", "default": "0" },
+        "DesiredCapacity": { "source": "/DesiredCapacity", "default": "0" },
+        "InstanceCount": { "source": "/Instances/member", "default": "0" },
+        "AvailabilityZones": { "source": "/AvailabilityZones", "default": "-" }
+      },
+      "action_configs": {
+        "delete_auto_scaling_group": {
+          "action_id": "delete_auto_scaling_group",
+          "protocol": "query",
+          "action": "DeleteAutoScalingGroup",
+          "id_param": "AutoScalingGroupName",
+          "static_params": {
+            "ForceDelete": "true"
+          }
+        }
+      }
+    }
+  }
+}

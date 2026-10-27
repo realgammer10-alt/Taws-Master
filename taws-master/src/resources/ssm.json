@@ -1,0 +1,42 @@
+{
+  "resources": {
+    "ssm-parameters": {
+      "display_name": "SSM Parameters",
+      "service": "ssm",
+      "sdk_method": "describe_parameters",
+      "sdk_method_params": {},
+      "response_path": "parameters",
+      "id_field": "Name",
+      "name_field": "Name",
+      "is_global": false,
+      "columns": [
+        { "header": "PARAMETER NAME", "json_path": "Name", "width": 45 },
+        { "header": "TYPE", "json_path": "Type", "width": 15 },
+        { "header": "TIER", "json_path": "Tier", "width": 12 },
+        { "header": "LAST MODIFIED", "json_path": "LastModifiedDate", "width": 25 }
+      ],
+      "sub_resources": [],
+      "actions": [
+        { "key": "x", "display_name": "View Parameter Value", "shortcut": "x", "sdk_method": "get_parameter", "show_result": true }
+      ],
+      "api_config": {
+        "protocol": "json",
+        "action": "DescribeParameters",
+        "response_root": "/Parameters",
+        "pagination": {
+          "input_token": "NextToken",
+          "output_token": "/NextToken",
+          "max_results_param": "MaxResults",
+          "max_results": 50
+        }
+      },
+      "field_mappings": {
+        "Name": { "source": "/Name", "default": "-" },
+        "Type": { "source": "/Type", "default": "-" },
+        "Tier": { "source": "/Tier", "default": "-" },
+        "LastModifiedDate": { "source": "/LastModifiedDate", "default": "-" },
+        "Description": { "source": "/Description", "default": "-" }
+      }
+    }
+  }
+}

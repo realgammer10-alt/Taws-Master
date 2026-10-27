@@ -1,0 +1,37 @@
+{
+  "resources": {
+    "sns-topics": {
+      "display_name": "SNS Topics",
+      "service": "sns",
+      "sdk_method": "list_topics",
+      "sdk_method_params": {},
+      "response_path": "topics",
+      "id_field": "TopicArn",
+      "name_field": "TopicArn",
+      "is_global": false,
+      "columns": [
+        { "header": "TOPIC ARN", "json_path": "TopicArn", "width": 80 }
+      ],
+      "sub_resources": [],
+      "actions": [
+        { "key": "ctrl+d", "display_name": "Delete Topic", "shortcut": "ctrl+d", "sdk_method": "delete_topic", "confirm": { "message": "Delete SNS topic", "default_yes": false, "destructive": true } }
+      ],
+      "api_config": {
+        "protocol": "query",
+        "action": "ListTopics",
+        "response_root": "/ListTopicsResponse/ListTopicsResult/Topics/member"
+      },
+      "field_mappings": {
+        "TopicArn": { "source": "/TopicArn", "default": "-" }
+      },
+      "action_configs": {
+        "delete_topic": {
+          "action_id": "delete_topic",
+          "protocol": "query",
+          "action": "DeleteTopic",
+          "id_param": "TopicArn"
+        }
+      }
+    }
+  }
+}

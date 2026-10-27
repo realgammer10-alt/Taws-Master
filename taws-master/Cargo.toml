@@ -1,0 +1,63 @@
+[package]
+name = "taws"
+version = "1.3.0-rc.8"
+edition = "2021"
+description = "Terminal UI for AWS - navigate, observe, and manage AWS resources"
+license = "MIT"
+repository = "https://github.com/huseyinbabal/taws"
+homepage = "https://github.com/huseyinbabal/taws"
+readme = "README.md"
+keywords = ["aws", "tui", "terminal", "cloud", "infrastructure"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Huseyin Babal"]
+
+[dependencies]
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# AWS (lightweight - SigV4 only, no SDK)
+aws-sigv4 = "1.2"
+aws-credential-types = "1.2"
+aws-smithy-runtime-api = "1.2"
+
+# HTTP client (using rustls to avoid OpenSSL cross-compilation issues)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+url = "2.5"
+urlencoding = "2.1"
+
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# XML parsing (for EC2, IAM, RDS Query protocol APIs)
+quick-xml = { version = "0.39", features = ["serialize"] }
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Utils
+anyhow = "1.0"
+thiserror = "2.0"
+dirs = "6.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+sha1 = "0.10"
+sha2 = "0.10"
+open = "5.3"
+fuzzy-matcher = "0.3.7"
+async-trait = "0.1.89"
+arboard = "3.6"
+
+[dev-dependencies]
+dirs = "6.0"
+tempfile = "3.24.0"

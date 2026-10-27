@@ -1,0 +1,34 @@
+{
+  "resources": {
+    "cloudfront-distributions": {
+      "display_name": "CloudFront Distributions",
+      "service": "cloudfront",
+      "sdk_method": "list_distributions",
+      "sdk_method_params": {},
+      "response_path": "distributions",
+      "id_field": "Id",
+      "name_field": "DomainName",
+      "is_global": true,
+      "columns": [
+        { "header": "DISTRIBUTION ID", "json_path": "Id", "width": 18 },
+        { "header": "DOMAIN NAME", "json_path": "DomainName", "width": 40 },
+        { "header": "STATUS", "json_path": "Status", "width": 12, "color_map": "state" },
+        { "header": "ENABLED", "json_path": "Enabled", "width": 10 }
+      ],
+      "sub_resources": [],
+      "actions": [],
+      "api_config": {
+        "protocol": "rest-xml",
+        "method": "GET",
+        "path": "/2020-05-31/distribution",
+        "response_root": "/DistributionList/Items/DistributionSummary"
+      },
+      "field_mappings": {
+        "Id": { "source": "/Id", "default": "-" },
+        "DomainName": { "source": "/DomainName", "default": "-" },
+        "Status": { "source": "/Status", "default": "-" },
+        "Enabled": { "source": "/Enabled", "transform": "bool_to_yes_no" }
+      }
+    }
+  }
+}
